@@ -20,6 +20,7 @@ $(RUNTESTS):
 	$(MAKE) -C $(@:run-%=%) run
 
 run: $(RUNTESTS)
+	$(MAKE) coverage
 
 $(COVTESTS):
 	$(MAKE) -C $(@:cov-%=%) coverage
