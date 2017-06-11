@@ -1,0 +1,15 @@
+#!/bin/bash
+
+set -e
+
+pushd $(git rev-parse --show-toplevel)
+
+uncrustify -c  support/uncrustify.cfg --no-backup \
+        `find -name "*.[ch]"`
+
+if [[ $(git diff) ]]; then
+    echo "git diff output is non-empty after uncrustify-pass run"
+    exit 1
+fi
+
+popd

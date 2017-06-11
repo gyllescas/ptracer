@@ -1,0 +1,18 @@
+sudo: required
+
+langauge: c
+
+services:
+- docker
+
+dist: trusty
+
+script:
+- ./support/ci-build.sh
+
+after_success:
+- bash <(curl -s https://codecov.io/bash) -X gcov
+
+notifications:
+  slack:
+    secure: hs0RaPS17fqSb6YHN6olSmxQIq3nAAaLjBKqG/ULRZyXhOQ+p0lvoJ0DeRetOMn7WF+JOIgZdyiZ4HbaFRV+eif11PvUx6mX4B1g+DZ1wq0Rl60SHD3ghCJve37V4o1eImpCPMahMrm2lzYSRSy6gm980qty6hy8ukYaOzpWQcE3kY2qxtDJJ8awEagTRuvhd2jMqzNb146LZAQg7py+pY2ZlYdzGVnLrHJy7UKUL0gK2lght/5tl8YywW6JRwv//4RBIrA7M92rKk8424gYHfqLBE6JUsDLACSpEeAFrr0C/RBjc3oU0+0pxSihpODz33rIIPREXDvL6QXMRCjYFA66uiK4aFb5rbU6dJkqWj4jOTERzhOaT13OlMh+5uYRgOUywB2YXuz6Oxx5RUY9t8hameIvSo0PRr7fFbhB6qNMGH43PNWECOMpM3s277aTV+CoVsmR/5hcbfFzbs9h30IOK5nOl6/hZpB0hN/GdOD/6LkuAzHJ7BAc+/nZxloncj5vlrzVnSVb5cSmVmxMERwdZAc3Um1UrjUyPgMfIMaWdGAvjiv5Mqd8240fcIf2hYb/mBAyfRLhVSF4BGHdLiFFmtKr4t++XIxeBfriQfyiq/Znag7BSDRj4+YTNelEOH8g2C5zocKApBu16+R34TjNsJFmaVMbEtw9cAfMTyU=
