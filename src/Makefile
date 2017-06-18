@@ -1,7 +1,7 @@
 .PHONY: all clean
 
-CFLAGS := -Werror -Wall -Wextra -MMD
-LDLIBS := -ldwarf
+CFLAGS := -Werror -Wall -Wextra -MMD -g
+LDLIBS := -ldwarf -lelf
 
 SRC_FILES := ptracer.c
 SRC_FILES += parse_args.c

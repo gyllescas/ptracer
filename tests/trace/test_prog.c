@@ -1,10 +1,10 @@
 #include <stdio.h>
 #include <stdlib.h>
 
-int
-func1(void)
+void func1(void)
 {
-  printf("Hello world\n");
+  asm volatile("pause");
+  asm volatile("pause");
 }
 
 int

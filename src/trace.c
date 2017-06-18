@@ -5,8 +5,14 @@
 #include <unistd.h>
 #include <stdlib.h>
 #include <string.h>
+#include <sys/wait.h>
+#include <sys/ptrace.h>
+#include <errno.h>
+#include <sys/user.h>
 
 #include "trace.h"
+
+#define HIGH_BIT_MASK (~((unsigned long)0xFF))
 
 static bool
 trace_info_initialize(program_arguments_t *args, trace_info_t *trace_info)
@@ -115,6 +121,7 @@ trace_cu_find_functions(program_arguments_t *args,
       return -1;
     }
     else if(res == 1) {
+      trace_info->next_func++;
       count++;
     }
 
@@ -173,6 +180,7 @@ trace_find_functions(program_arguments_t *args, trace_info_t *trace_info)
       goto failure;
     }
 
+    previous_die = 0;
     while((res = dwarf_siblingof(trace_info->dbg, previous_die,
                                  &cu_die, &err)) != DW_DLV_NO_ENTRY) {
 
@@ -201,20 +209,375 @@ trace_find_functions(program_arguments_t *args, trace_info_t *trace_info)
   return false;
 }
 
+static bool
+trace_add_breakpoint(pid_t pid, function_information_t *func_info) {
+
+  errno = 0;
+
+  func_info->original = ptrace(PTRACE_PEEKTEXT, pid, (void *)func_info->ip, 0);
+
+  if(errno) {
+    return false;
+  }
+
+  ptrace(PTRACE_POKETEXT, pid, (void *)func_info->ip,
+         (func_info->original & HIGH_BIT_MASK) | 0xCC);
+
+  return errno == 0;
+}
+
 bool
-trace_add_breakpoints(pid_t child_pid, trace_info_t *trace_info)
+trace_add_breakpoints(trace_info_t *trace_info)
 {
-  (void)child_pid;
-  (void)trace_info;
+  int i;
+
+  for(i = 0; i < trace_info->num_func_infos; i++) {
+    if(!trace_add_breakpoint(trace_info->child_pid,
+                             &(trace_info->function_infos[i]))) {
+      kill(trace_info->child_pid, SIGKILL);
+      return false;
+    }
+  }
+
+  ptrace(PTRACE_CONT, trace_info->child_pid, NULL, NULL);
+
+  return true;
+}
+
+bool
+trace_launch(program_arguments_t *args, trace_info_t *trace_info)
+{
+  int status;
+  int res;
+
+  trace_info->child_pid = fork();
+
+  if(trace_info->child_pid == -1) {
+    return false;
+  }
+
+  if(trace_info->child_pid) {
+    /* parent */
+
+    res = waitpid(trace_info->child_pid, &status, 0);
+    return res != -1 && ((!WIFEXITED(status)) && (!WIFSIGNALED(status)));
+  }
+  else {
+    /* child */
+
+    close(trace_info->prog_fd);
+    ptrace(PTRACE_TRACEME, 0, NULL, NULL);
+    execvp(args->child_args[0], args->child_args);
+
+    fprintf(stderr, "exec failed: errno %d\n", errno);
+    exit(EXIT_FAILURE);
+  }
 
   return false;
 }
 
-bool
-trace_run(program_arguments_t *args, trace_info_t *trace_info)
+static bool
+trace_get_child_ip(trace_info_t *trace_info, unsigned long *ip)
 {
-  (void)args;
-  (void)trace_info;
+  struct user_regs_struct regs;
 
-  return false;
+  if(ptrace(PTRACE_GETREGS, trace_info->child_pid, NULL, &regs) < 0) {
+    fprintf(stderr, "Failed to get child ip\n");
+    return false;
+  }
+
+  *ip = regs.rip;
+
+  return true;
+}
+
+static bool
+trace_restore_function(trace_info_t *trace_info,
+                       function_information_t *func_info)
+{
+  long data;
+
+  errno = 0;
+  data = ptrace(PTRACE_PEEKTEXT, trace_info->child_pid,
+                (void*)func_info->ip, 0);
+
+  if(errno) {
+    return false;
+  }
+
+  ptrace(PTRACE_POKETEXT, trace_info->child_pid, (void*)func_info->ip,
+         (data & HIGH_BIT_MASK) | (func_info->original & 0xFF));
+
+  if(errno) {
+    return false;
+  }
+
+  return true;
+}
+
+static bool
+trace_get_return_address(trace_info_t *trace_info, unsigned long *addr)
+{
+  struct user_regs_struct regs;
+  long data;
+
+  if(ptrace(PTRACE_GETREGS, trace_info->child_pid, NULL, &regs) < 0) {
+    fprintf(stderr, "Failed to get child ip\n");
+    return false;
+  }
+
+  errno = 0;
+  data = ptrace(PTRACE_PEEKTEXT, trace_info->child_pid, (void*)regs.rsp, 0);
+
+  if(errno) {
+    return false;
+  }
+
+  *addr = data;
+
+  return true;
+}
+
+static bool
+trace_single_step(trace_info_t *trace_info)
+{
+  int status;
+
+  if(ptrace(PTRACE_SINGLESTEP, trace_info->child_pid, NULL, NULL) < 0) {
+    fprintf(stderr, "ptrace(PTRACE_SINGLESTEP) failed\n");
+    return false;
+  }
+
+  waitpid(trace_info->child_pid, &status, 0);
+
+  if(WIFEXITED(status) || WIFSIGNALED(status)) {
+    trace_info->child_pid = -1;
+    return false;
+  }
+
+  return true;
+}
+
+int
+trace_count_instructions(trace_info_t *trace_info,
+                         function_information_t *func_info,
+                         size_t *count)
+{
+  unsigned long return_address;
+  unsigned long ip;
+  int status;
+  struct user_regs_struct regs;
+
+  *count = 0;
+
+  trace_get_return_address(trace_info, &return_address);
+
+  if(ptrace(PTRACE_GETREGS, trace_info->child_pid, NULL, &regs) < 0) {
+    fprintf(stderr, "failed to get child register values\n");
+    return false;
+  }
+
+  regs.rip = regs.rip - 1;
+
+  if(ptrace(PTRACE_SETREGS, trace_info->child_pid, NULL, &regs) < 0) {
+    return false;
+  }
+
+  if(!trace_restore_function(trace_info, func_info)) {
+    fprintf(stderr, "Failed to restore function\n");
+    return false;
+  }
+
+  if(!trace_single_step(trace_info)) {
+    return false;
+  }
+
+  if(!trace_add_breakpoint(trace_info->child_pid, func_info)) {
+    fprintf(stderr, "trace_add_breakpoint failed\n");
+    return false;
+  }
+
+  (*count)++;
+
+  while(true) {
+    trace_get_child_ip(trace_info, &ip);
+
+    if(ip == return_address) {
+      break;
+    }
+
+    if(!trace_single_step(trace_info)) {
+      return false;
+    }
+    (*count)++;
+  }
+
+  if(!trace_restore_function(trace_info, func_info)) {
+    fprintf(stderr, "Failed to restore function\n");
+    return false;
+  }
+
+  if(ptrace(PTRACE_SINGLESTEP, trace_info->child_pid, NULL, NULL) < 0) {
+    fprintf(stderr, "ptrace(PTRACE_SINGLESTEP) failed\n");
+    return false;
+  }
+
+  waitpid(trace_info->child_pid, &status, 0);
+
+  if(WIFEXITED(status) || WIFSIGNALED(status)) {
+    trace_info->child_pid = -1;
+    return false;
+  }
+
+  if(!trace_add_breakpoint(trace_info->child_pid, func_info)) {
+    fprintf(stderr, "trace_add_breakpoint failed\n");
+    return false;
+  }
+
+  if(ptrace(PTRACE_GETREGS, trace_info->child_pid, NULL, &regs) < 0) {
+    fprintf(stderr, "failed to get child register values\n");
+    return false;
+  }
+
+  if(ptrace(PTRACE_CONT, trace_info->child_pid, NULL, NULL) < 0) {
+    fprintf(stderr, "ptrace(PTRACE_CONT) failed\n");
+    return false;
+  }
+
+  return true;
+}
+
+
+bool
+trace_continue(trace_info_t *trace_info, function_information_t *func_info)
+{
+  int status;
+  struct user_regs_struct regs;
+
+  if(ptrace(PTRACE_GETREGS, trace_info->child_pid, NULL, &regs) < 0) {
+    fprintf(stderr, "failed to get child register values\n");
+    return false;
+  }
+
+  regs.rip = regs.rip - 1;
+
+  if(ptrace(PTRACE_SETREGS, trace_info->child_pid, NULL, &regs) < 0) {
+    return false;
+  }
+
+  if(!trace_restore_function(trace_info, func_info)) {
+    fprintf(stderr, "Failed to restore function\n");
+    return false;
+  }
+
+  if(ptrace(PTRACE_SINGLESTEP, trace_info->child_pid, NULL, NULL) < 0) {
+    fprintf(stderr, "ptrace(PTRACE_SINGLESTEP) failed\n");
+    return false;
+  }
+
+  waitpid(trace_info->child_pid, &status, 0);
+
+  if(WIFEXITED(status) || WIFSIGNALED(status)) {
+    trace_info->child_pid = -1;
+    return false;
+  }
+
+  if(!trace_add_breakpoint(trace_info->child_pid, func_info)) {
+    fprintf(stderr, "trace_add_breakpoint failed\n");
+    return false;
+  }
+
+  if(ptrace(PTRACE_GETREGS, trace_info->child_pid, NULL, &regs) < 0) {
+    fprintf(stderr, "failed to get child register values\n");
+    return false;
+  }
+
+  if(ptrace(PTRACE_CONT, trace_info->child_pid, NULL, NULL) < 0) {
+    fprintf(stderr, "ptrace(PTRACE_CONT) failed\n");
+    return false;
+  }
+
+  return true;
+}
+
+static function_information_t *
+trace_find_function_info(trace_info_t *trace_info, unsigned long ip) {
+
+  int i;
+
+  for(i = 0; i < trace_info->num_func_infos; i++) {
+    if(trace_info->function_infos[i].ip == (ip - 1)) {
+      return  &trace_info->function_infos[i];
+    }
+  }
+
+  return NULL;
+}
+
+static bool
+trace_function_call(trace_info_t *trace_info, results_t *results)
+{
+  unsigned long ip;
+  function_information_t *func_info;
+  size_t count;
+  bool res;
+
+  (void) results;
+
+  if(!trace_get_child_ip(trace_info, &ip)) {
+    return false;
+  }
+
+  func_info = trace_find_function_info(trace_info, ip);
+
+  if(func_info == NULL) {
+    if(ptrace(PTRACE_CONT, trace_info->child_pid, NULL, NULL) < 0) {
+      fprintf(stderr, "ptrace(PTRACE_CONT) failed\n");
+      return false;
+    }
+
+    return true;
+  }
+
+  res = trace_count_instructions(trace_info, func_info, &count);
+
+  if(res) {
+    return true;
+  }
+  else {
+    return false;
+  }
+}
+
+bool
+trace_function_calls(trace_info_t *trace_info, results_t *results)
+{
+  int res;
+  int status;
+
+  while(true) {
+
+    res = waitpid(trace_info->child_pid, &status, 0);
+
+    if(res == -1) {
+      fprintf(stderr, "waitpid returned -1, error is %d\n", errno);
+      return false;
+    }
+
+    if(WIFEXITED(status)) {
+      printf("Program exited with exit code %d\n", WEXITSTATUS(status));
+      break;
+    }
+
+    if(WIFSIGNALED(status)) {
+      printf("Program terminated by signal %d\n", WTERMSIG(status));
+      break;
+    }
+
+    if(!trace_function_call(trace_info, results)) {
+      return false;
+    }
+  }
+
+  return true;
 }
